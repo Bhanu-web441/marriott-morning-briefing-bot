@@ -1,8 +1,6 @@
-import time
-from pathlib import Path
-
 import pandas as pd
 import streamlit as st
+from pathlib import Path
 from google import genai
 
 
@@ -18,43 +16,29 @@ st.set_page_config(
 
 
 # ============================================================
-# APPLICATION SETTINGS
+# SETTINGS
 # ============================================================
 
-APP_TITLE = "Marriott Morning Briefing Bot"
-
-# Excel file must be in the same GitHub repository as app.py
 FILE_NAME = "Marriott_Morning_Briefing_Bot.xlsx"
 
-# Models are tried in this order.
-# If the first model is temporarily unavailable, the app
-# automatically attempts another model.
+# Try these models in order.
+# If one is temporarily unavailable, move immediately
+# to the next model instead of waiting through many retries.
 MODEL_CANDIDATES = [
     "gemini-3.1-flash-lite",
-    "gemini-3-flash-preview",
-    "gemini-2.5-flash",
+    "gemini-3-flash-preview"
 ]
 
-MAX_RETRIES_PER_MODEL = 2
-
 
 # ============================================================
-# GET GEMINI API KEY
+# GEMINI API KEY
 # ============================================================
 
-def get_api_key():
-    """
-    Read the Gemini API key securely from Streamlit Secrets.
-    Never place the real API key directly in this Python file.
-    """
+try:
+    api_key = st.secrets["GEMINI_API_KEY"]
+except Exception:
+    api_key = None
 
-    try:
-        return st.secrets["GEMINI_API_KEY"]
-    except Exception:
-        return None
-
-
-api_key = get_api_key()
 
 if not api_key:
     st.error(
@@ -64,7 +48,6 @@ if not api_key:
     st.stop()
 
 
-# Create Gemini client
 client = genai.Client(api_key=api_key)
 
 
@@ -72,25 +55,14 @@ client = genai.Client(api_key=api_key)
 # LOAD EXCEL DATA
 # ============================================================
 
-@st.cache_data
+@st.cache_data(show_spinner=False)
 def load_data():
-    """
-    Load the simulated hotel operations workbook.
-
-    The workbook contains:
-    Occupancy
-    Reservations
-    VIP Requests
-    HK Maintenance
-    Staffing Roster
-    Guest Reviews
-    """
 
     file_path = Path(__file__).parent / FILE_NAME
 
     if not file_path.exists():
         raise FileNotFoundError(
-            f"{FILE_NAME} was not found in the application folder."
+            f"{FILE_NAME} was not found."
         )
 
     occupancy = pd.read_excel(
@@ -129,49 +101,39 @@ def load_data():
         header=3
     )
 
-    return (
-        occupancy,
-        reservations,
-        vip,
-        maintenance,
-        staffing,
-        reviews
-    )
+    return {
+        "occupancy": occupancy,
+        "reservations": reservations,
+        "vip": vip,
+        "maintenance": maintenance,
+        "staffing": staffing,
+        "reviews": reviews
+    }
 
 
 # ============================================================
-# LOAD DATA SAFELY
+# LOAD DATA
 # ============================================================
 
 try:
-    (
-        occupancy,
-        reservations,
-        vip,
-        maintenance,
-        staffing,
-        reviews
-    ) = load_data()
+    datasets = load_data()
 
 except Exception as e:
 
-    st.error("Unable to load the Marriott Excel dataset.")
+    st.error(
+        "Unable to load the simulated hotel dataset."
+    )
 
-    # Friendly diagnostic message without displaying a
-    # complete Python traceback to public users.
     st.error(str(e))
 
     st.stop()
 
 
 # ============================================================
-# DATA CLEANING HELPER
+# CLEAN DATA
 # ============================================================
 
 def clean_dataframe(df):
-    """
-    Remove completely empty rows and columns.
-    """
 
     df = df.dropna(how="all")
     df = df.dropna(axis=1, how="all")
@@ -179,183 +141,348 @@ def clean_dataframe(df):
     return df
 
 
-occupancy = clean_dataframe(occupancy)
-reservations = clean_dataframe(reservations)
-vip = clean_dataframe(vip)
-maintenance = clean_dataframe(maintenance)
-staffing = clean_dataframe(staffing)
-reviews = clean_dataframe(reviews)
+for key in datasets:
+    datasets[key] = clean_dataframe(
+        datasets[key]
+    )
 
 
 # ============================================================
-# CONVERT DATAFRAME TO TEXT
+# DATAFRAME TO TEXT
 # ============================================================
 
-def dataframe_to_text(df, max_rows=60):
+def dataframe_to_text(df, max_rows=40):
     """
-    Convert a dataframe into compact text for Gemini.
+    Convert only the necessary portion of a dataframe
+    into text for Gemini.
 
-    Limiting rows helps control API usage and prompt size.
+    Limiting rows makes requests smaller and faster.
     """
 
     if df.empty:
         return "No records available."
 
-    safe_df = df.head(max_rows).copy()
+    data = df.head(max_rows).copy()
 
-    # Convert missing values into readable blanks
-    safe_df = safe_df.fillna("")
+    data = data.fillna("")
 
-    return safe_df.to_string(index=False)
+    return data.to_string(
+        index=False
+    )
 
 
 # ============================================================
-# CREATE HOTEL DATA CONTEXT
+# QUESTION ROUTER
 # ============================================================
 
-def build_hotel_context():
+def determine_relevant_data(question):
     """
-    Create the operational information that Gemini can analyze.
+    Determine which hotel datasets are relevant.
+
+    This prevents sending the complete workbook to Gemini
+    for simple questions.
     """
 
-    context = f"""
-SIMULATED HOTEL OPERATIONS DATA
+    q = question.lower()
 
-IMPORTANT:
-This is simulated Marriott case-study data used only for
-academic purposes. It is not actual Marriott International
-operational information.
+    selected = []
 
 
+    # OCCUPANCY
+    occupancy_words = [
+        "occupancy",
+        "occupied",
+        "rooms booked",
+        "available rooms",
+        "room availability",
+        "demand",
+        "high demand"
+    ]
+
+    if any(word in q for word in occupancy_words):
+        selected.append("occupancy")
+
+
+    # RESERVATIONS
+    reservation_words = [
+        "reservation",
+        "reservations",
+        "arrival",
+        "arrivals",
+        "booking",
+        "bookings",
+        "check-in",
+        "check in",
+        "check-out",
+        "check out"
+    ]
+
+    if any(word in q for word in reservation_words):
+        selected.append("reservations")
+
+
+    # VIP REQUESTS
+    vip_words = [
+        "vip",
+        "special request",
+        "special requests",
+        "guest request",
+        "guest requests",
+        "pending request"
+    ]
+
+    if any(word in q for word in vip_words):
+        selected.append("vip")
+
+
+    # MAINTENANCE
+    maintenance_words = [
+        "maintenance",
+        "repair",
+        "repairs",
+        "issue",
+        "issues",
+        "housekeeping",
+        "broken",
+        "fault",
+        "critical"
+    ]
+
+    if any(word in q for word in maintenance_words):
+        selected.append("maintenance")
+
+
+    # STAFFING
+    staffing_words = [
+        "staff",
+        "staffing",
+        "shortage",
+        "shortages",
+        "coverage",
+        "employee",
+        "employees",
+        "roster",
+        "shift",
+        "shifts"
+    ]
+
+    if any(word in q for word in staffing_words):
+        selected.append("staffing")
+
+
+    # REVIEWS
+    review_words = [
+        "review",
+        "reviews",
+        "rating",
+        "ratings",
+        "feedback",
+        "complaint",
+        "complaints",
+        "guest satisfaction"
+    ]
+
+    if any(word in q for word in review_words):
+        selected.append("reviews")
+
+
+    # MANAGEMENT / EXECUTIVE QUESTIONS
+    # These require information across several datasets.
+
+    management_words = [
+        "management",
+        "manager",
+        "morning briefing",
+        "executive briefing",
+        "top three",
+        "top 3",
+        "priorities",
+        "priority",
+        "important actions",
+        "operational risk",
+        "operational risks",
+        "overall situation",
+        "hotel situation"
+    ]
+
+    if any(word in q for word in management_words):
+
+        selected = [
+            "occupancy",
+            "reservations",
+            "vip",
+            "maintenance",
+            "staffing",
+            "reviews"
+        ]
+
+
+    # If no category is recognized,
+    # send a limited version of all datasets.
+
+    if not selected:
+
+        selected = [
+            "occupancy",
+            "reservations",
+            "vip",
+            "maintenance",
+            "staffing",
+            "reviews"
+        ]
+
+
+    # Remove duplicates while maintaining order
+
+    selected = list(
+        dict.fromkeys(selected)
+    )
+
+    return selected
+
+
+# ============================================================
+# BUILD ONLY NECESSARY CONTEXT
+# ============================================================
+
+def build_context(question):
+
+    relevant = determine_relevant_data(
+        question
+    )
+
+    sections = []
+
+
+    labels = {
+
+        "occupancy":
+            "OCCUPANCY",
+
+        "reservations":
+            "RESERVATIONS",
+
+        "vip":
+            "VIP AND SPECIAL REQUESTS",
+
+        "maintenance":
+            "HOUSEKEEPING AND MAINTENANCE",
+
+        "staffing":
+            "STAFFING ROSTER",
+
+        "reviews":
+            "GUEST REVIEWS"
+    }
+
+
+    for key in relevant:
+
+        sections.append(
+            f"""
 ==============================
-OCCUPANCY
+{labels[key]}
 ==============================
 
-{dataframe_to_text(occupancy)}
-
-
-==============================
-RESERVATIONS
-==============================
-
-{dataframe_to_text(reservations)}
-
-
-==============================
-VIP REQUESTS
-==============================
-
-{dataframe_to_text(vip)}
-
-
-==============================
-HOUSEKEEPING / MAINTENANCE
-==============================
-
-{dataframe_to_text(maintenance)}
-
-
-==============================
-STAFFING
-==============================
-
-{dataframe_to_text(staffing)}
-
-
-==============================
-GUEST REVIEWS
-==============================
-
-{dataframe_to_text(reviews)}
-
+{dataframe_to_text(datasets[key])}
 """
+        )
 
-    return context
 
-
-hotel_context = build_hotel_context()
+    return "\n".join(sections)
 
 
 # ============================================================
-# GEMINI ERROR CLASSIFICATION
+# CHECK TEMPORARY API ERRORS
 # ============================================================
 
-def is_temporary_error(error):
-    """
-    Determine whether an API failure is likely temporary.
-    """
+def temporary_api_error(error):
 
-    error_text = str(error).lower()
+    text = str(error).lower()
 
     temporary_terms = [
         "503",
         "unavailable",
         "high demand",
-        "temporarily",
-        "timeout",
-        "timed out",
+        "overloaded",
         "429",
         "resource_exhausted",
         "rate limit",
-        "overloaded"
+        "timeout",
+        "timed out"
     ]
 
-    return any(term in error_text for term in temporary_terms)
+    return any(
+        term in text
+        for term in temporary_terms
+    )
 
 
 # ============================================================
-# ASK MARRIOTT BOT
+# ASK GEMINI
 # ============================================================
 
 def ask_marriott_bot(question):
-    """
-    Send the user's question and simulated hotel data to Gemini.
 
-    Features:
-    - retries temporary failures
-    - tries backup models
-    - avoids displaying technical traceback information
-    """
+    context = build_context(
+        question
+    )
 
     prompt = f"""
-You are the AI assistant for an academic project called
-Marriott Morning Briefing Bot.
+You are the Marriott Morning Briefing Bot,
+an AI assistant created for an academic hotel
+operations project.
 
-Your purpose is to help hotel managers understand simulated
-daily hotel operations data.
+IMPORTANT DATA RULE:
 
-The records supplied below are simulated academic records.
-They are NOT actual Marriott International operational data.
+The information below is simulated academic
+Marriott case-study data.
 
-Answer the user's question using ONLY the supplied dataset.
+It is NOT actual Marriott International
+operational data.
+
+Answer the user's question using ONLY the
+provided simulated hotel records.
+
+Do not invent information.
 
 Do not invent:
-- guests
-- reservation numbers
-- occupancy percentages
-- maintenance issues
-- staffing shortages
-- VIP requests
-- review information
-- dates
-- operational events
 
-If the requested information cannot be determined from the
-dataset, clearly say that the available simulated data does
-not provide enough information.
+guest names,
+reservation IDs,
+occupancy percentages,
+dates,
+maintenance problems,
+VIP requests,
+staffing shortages,
+ratings,
+or operational events.
 
-When appropriate:
+If the dataset does not contain enough
+information to answer the question, clearly
+state:
 
-1. Summarize the operational situation.
-2. Identify important risks or exceptions.
-3. Recommend practical management actions.
-4. Prioritize urgent issues.
-5. Keep the answer concise and useful for a hotel morning
-   management briefing.
+"The available simulated dataset does not
+provide enough information to determine that."
 
-HOTEL DATA:
+For management questions:
 
-{hotel_context}
+1. Identify the most important findings.
+2. Prioritize urgent operational problems.
+3. Explain why they matter.
+4. Recommend practical management actions.
+
+Keep normal answers concise.
+
+Use bullet points when they improve readability.
+
+Do not unnecessarily repeat the academic
+disclaimer in every answer.
+
+
+SIMULATED HOTEL DATA:
+
+{context}
 
 
 USER QUESTION:
@@ -363,58 +490,58 @@ USER QUESTION:
 {question}
 
 
-Provide the management briefing answer:
+ANSWER:
 """
 
-    last_error = None
+
+    # ========================================================
+    # FAST MODEL FALLBACK
+    # ========================================================
 
     for model_name in MODEL_CANDIDATES:
 
-        for attempt in range(MAX_RETRIES_PER_MODEL):
+        try:
 
-            try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt
+            )
 
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=prompt
-                )
+            if response and response.text:
 
-                if response and response.text:
-                    return response.text
+                return response.text
 
-            except Exception as e:
 
-                last_error = e
+        except Exception as e:
 
-                if is_temporary_error(e):
+            error_text = str(e).lower()
 
-                    # Wait briefly before retrying.
-                    time.sleep(2 + attempt)
+            # Immediately try next model for temporary errors.
+            # No long sleep/retry cycle.
 
-                    continue
+            if temporary_api_error(e):
+                continue
 
-                # If the model is unavailable/not supported,
-                # continue to the next candidate.
-                error_text = str(e).lower()
+            # Also move to backup if model is unavailable.
 
-                if (
-                    "404" in error_text
-                    or "not found" in error_text
-                    or "model" in error_text
-                ):
-                    break
+            if (
+                "404" in error_text
+                or "not found" in error_text
+                or "model" in error_text
+            ):
+                continue
 
-                return (
-                    "I encountered a problem while analyzing "
-                    "the hotel data. Please try again."
-                )
+            return (
+                "I encountered a temporary problem while "
+                "analyzing the hotel data. Please try again."
+            )
 
-    # Every model/retry failed
+
     return (
-        "The AI service is temporarily busy or unavailable. "
-        "Your hotel data loaded successfully, but the AI model "
-        "could not respond right now. Please wait a few seconds "
-        "and try your question again."
+        "The AI service is currently busy. "
+        "The hotel dataset loaded successfully, but an AI "
+        "response could not be generated right now. "
+        "Please try again in a few moments."
     )
 
 
@@ -425,12 +552,15 @@ Provide the management briefing answer:
 if "messages" not in st.session_state:
 
     st.session_state.messages = [
+
         {
             "role": "assistant",
+
             "content":
                 "Welcome to the Marriott Morning Briefing Bot. "
                 "Ask me about hotel operations."
         }
+
     ]
 
 
@@ -443,20 +573,26 @@ with st.sidebar:
     st.header("About")
 
     st.write(
-        "This chatbot analyzes a simulated 30-day "
-        "Marriott hotel operations dataset."
+        "This chatbot analyzes a simulated "
+        "30-day Marriott hotel operations dataset."
     )
 
     st.write("**Data analyzed:**")
 
     st.write("• Occupancy")
+
     st.write("• Reservations")
+
     st.write("• VIP requests")
+
     st.write("• Maintenance")
+
     st.write("• Staffing")
+
     st.write("• Guest reviews")
 
     st.divider()
+
 
     if st.button(
         "Clear Conversation",
@@ -464,32 +600,39 @@ with st.sidebar:
     ):
 
         st.session_state.messages = [
+
             {
                 "role": "assistant",
+
                 "content":
-                    "Welcome to the Marriott Morning Briefing Bot. "
-                    "Ask me about hotel operations."
+                    "Welcome to the Marriott Morning "
+                    "Briefing Bot. Ask me about "
+                    "hotel operations."
             }
+
         ]
 
         st.rerun()
 
 
 # ============================================================
-# MAIN PAGE
+# TITLE
 # ============================================================
 
-st.title("🏨 Marriott Morning Briefing Bot")
+st.title(
+    "🏨 Marriott Morning Briefing Bot"
+)
 
 st.caption(
     "AI-assisted hotel operations briefing | "
     "Academic project using simulated Marriott data"
 )
 
+
 st.warning(
-    "All hotel records used in this application are simulated "
-    "for academic purposes and are not actual Marriott "
-    "International operational data."
+    "All hotel records used in this application "
+    "are simulated for academic purposes and are "
+    "not actual Marriott International operational data."
 )
 
 
@@ -497,36 +640,41 @@ st.warning(
 # SUGGESTED QUESTIONS
 # ============================================================
 
-st.header("Suggested Questions")
+st.header(
+    "Suggested Questions"
+)
 
 
-suggested_questions = {
-    "📊 Occupancy Situation":
-        "What is the occupancy situation and which dates "
-        "require the most management attention?",
+QUESTIONS = {
 
-    "🔧 Maintenance Priorities":
-        "What maintenance issues should management prioritize?",
+    "occupancy":
+        "What is the occupancy situation and which "
+        "dates require the most management attention?",
 
-    "🧳 Arrivals and Reservations":
-        "Summarize the most important upcoming arrivals "
-        "and reservation activity.",
+    "maintenance":
+        "What maintenance issues should management "
+        "prioritize?",
 
-    "⭐ Pending VIP Requests":
-        "Which VIP or special requests require attention?",
+    "reservations":
+        "Summarize the most important upcoming "
+        "arrivals and reservations.",
 
-    "👥 Staffing Shortages":
-        "Where are the most important staffing shortages "
-        "or coverage gaps?",
+    "vip":
+        "Which VIP or special requests require "
+        "attention?",
 
-    "🚨 Top 3 Management Actions":
+    "staffing":
+        "Where are the most important staffing "
+        "shortages or coverage gaps?",
+
+    "management":
         "What are the three most important actions "
         "management should take today?"
 }
 
 
 # ============================================================
-# FUNCTION FOR HANDLING QUESTIONS
+# PROCESS BUTTON QUESTION
 # ============================================================
 
 def process_question(question):
@@ -538,9 +686,11 @@ def process_question(question):
         }
     )
 
-    with st.spinner("Analyzing hotel operations..."):
 
-        answer = ask_marriott_bot(question)
+    answer = ask_marriott_bot(
+        question
+    )
+
 
     st.session_state.messages.append(
         {
@@ -551,7 +701,7 @@ def process_question(question):
 
 
 # ============================================================
-# QUESTION BUTTONS
+# BUTTON LAYOUT
 # ============================================================
 
 col1, col2, col3 = st.columns(3)
@@ -563,18 +713,23 @@ with col1:
         "📊 Occupancy Situation",
         use_container_width=True
     ):
+
         process_question(
-            suggested_questions["📊 Occupancy Situation"]
+            QUESTIONS["occupancy"]
         )
+
         st.rerun()
+
 
     if st.button(
         "⭐ Pending VIP Requests",
         use_container_width=True
     ):
+
         process_question(
-            suggested_questions["⭐ Pending VIP Requests"]
+            QUESTIONS["vip"]
         )
+
         st.rerun()
 
 
@@ -584,18 +739,23 @@ with col2:
         "🔧 Maintenance Priorities",
         use_container_width=True
     ):
+
         process_question(
-            suggested_questions["🔧 Maintenance Priorities"]
+            QUESTIONS["maintenance"]
         )
+
         st.rerun()
+
 
     if st.button(
         "👥 Staffing Shortages",
         use_container_width=True
     ):
+
         process_question(
-            suggested_questions["👥 Staffing Shortages"]
+            QUESTIONS["staffing"]
         )
+
         st.rerun()
 
 
@@ -605,18 +765,23 @@ with col3:
         "🧳 Arrivals and Reservations",
         use_container_width=True
     ):
+
         process_question(
-            suggested_questions["🧳 Arrivals and Reservations"]
+            QUESTIONS["reservations"]
         )
+
         st.rerun()
+
 
     if st.button(
         "🚨 Top 3 Management Actions",
         use_container_width=True
     ):
+
         process_question(
-            suggested_questions["🚨 Top 3 Management Actions"]
+            QUESTIONS["management"]
         )
+
         st.rerun()
 
 
@@ -626,12 +791,17 @@ with col3:
 
 for message in st.session_state.messages:
 
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+    with st.chat_message(
+        message["role"]
+    ):
+
+        st.markdown(
+            message["content"]
+        )
 
 
 # ============================================================
-# CHAT INPUT
+# USER CHAT INPUT
 # ============================================================
 
 user_question = st.chat_input(
@@ -641,6 +811,7 @@ user_question = st.chat_input(
 
 if user_question:
 
+    # Add user message
     st.session_state.messages.append(
         {
             "role": "user",
@@ -648,9 +819,14 @@ if user_question:
         }
     )
 
-    # Display the user's question immediately
+
+    # Display user message
     with st.chat_message("user"):
-        st.markdown(user_question)
+
+        st.markdown(
+            user_question
+        )
+
 
     # Generate answer
     with st.chat_message("assistant"):
@@ -663,8 +839,12 @@ if user_question:
                 user_question
             )
 
-        st.markdown(answer)
+        st.markdown(
+            answer
+        )
 
+
+    # Store answer
     st.session_state.messages.append(
         {
             "role": "assistant",
